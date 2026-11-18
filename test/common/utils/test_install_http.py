@@ -1,14 +1,20 @@
-"""Offline download-boundary tests, without importing NLP models or datasets.
+"""Download-boundary tests, without importing NLP models or datasets.
 
-Only the download helper definitions are compiled from the actual source file.
-External services are mocked; this is not an integration/model-runtime test.
+Mock tests compile only the helper definitions from the actual source file.
+Loopback tests load that file with real download dependencies and stub only its
+local logger/settings imports. Neither suite validates the full NLP runtime.
 """
 import ast
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
 import io
+import logging
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -155,6 +161,111 @@ class InstallHTTPTests(unittest.TestCase):
         self.assertEqual(result, str(cached))
         self.requests.get.assert_not_called()
         self.lock.__exit__.assert_called_once()
+
+
+class RealDependencyHTTPTests(unittest.TestCase):
+    """Exercise actual Requests/FileLock/tqdm without loading the NLP package."""
+
+    def setUp(self):
+        try:
+            import requests
+            import filelock
+            import tqdm
+        except ImportError as error:
+            self.skipTest('Download dependencies unavailable: {}'.format(error))
+        self.requests = requests
+        self.filelock = filelock
+        self.tqdm = tqdm
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = Path(self.tmp.name)
+        source = Path(os.environ.get(
+            'TEXTFLINT_INSTALL_SOURCE',
+            str(Path(__file__).resolve().parents[3] /
+                'textflint/common/utils/install.py')))
+        # Stub only TextFlint's two local imports, not its download dependencies.
+        package = '_textflint_download_test.common.utils'
+        logger = types.ModuleType(package + '.logger')
+        logger.logger = logging.getLogger(__name__)
+        settings = types.ModuleType('_textflint_download_test.common.settings')
+        settings.CACHE_DIR = str(self.cache)
+        modules = {logger.__name__: logger, settings.__name__: settings}
+        with mock.patch.dict(sys.modules, modules):
+            spec = importlib.util.spec_from_file_location(
+                package + '.install', source)
+            self.install = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.install)
+
+        self.paths = []
+        paths = self.paths
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                paths.append(self.path)
+                status = int(self.path[1:]) if self.path[1:].isdigit() else 200
+                if self.path == '/truncated':
+                    self.send_response(200)
+                    self.send_header('Content-Length', '100')
+                    self.end_headers()
+                    self.wfile.write(b'partial')
+                    self.close_connection = True
+                    return
+                self.send_response(status)
+                if 300 <= status < 400:
+                    self.send_header('Location', '/target')
+                self.send_header('Content-Length', '3')
+                self.end_headers()
+                self.wfile.write(b'abc')
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop_server)
+        # HTTP is confined to loopback; the separate live smoke uses real TLS.
+        self.install.textflint_url = lambda name: 'http://127.0.0.1:{}/{}'.format(
+            server.server_port, name)
+
+    def assert_clean_and_unlocked(self, name):
+        self.assertEqual(sorted(p.name for p in self.cache.iterdir()),
+                         [name + '.lock'])
+        with self.filelock.FileLock(str(self.cache / (name + '.lock')), timeout=0):
+            pass
+
+    def test_real_download_and_cache_hit(self):
+        result = self.install.download_if_needed('fixture.bin')
+        self.assertEqual(Path(result).read_bytes(), b'abc')
+        self.assertEqual(self.install.download_if_needed('fixture.bin'), result)
+        self.assertEqual(self.paths, ['/fixture.bin'])
+
+    def test_real_status_errors_and_redirects_do_not_enter_cache(self):
+        expected_locks = []
+        for status in (204, 206, 301, 302, 303, 304, 307, 308, 403, 404, 500):
+            with self.subTest(status=status):
+                name = str(status)
+                with self.assertRaises(self.requests.HTTPError):
+                    self.install.download_if_needed(name)
+                self.assertEqual(self.paths[-1], '/' + name)
+                self.assertNotIn('/target', self.paths)
+                expected_locks.append(name + '.lock')
+                self.assertEqual(sorted(p.name for p in self.cache.iterdir()),
+                                 sorted(expected_locks))
+                with self.filelock.FileLock(
+                        str(self.cache / (name + '.lock')), timeout=0):
+                    pass
+
+    def test_real_truncated_stream_cleans_temp_and_unlocks(self):
+        with self.assertRaises(self.requests.exceptions.ChunkedEncodingError):
+            self.install.download_if_needed('truncated')
+        self.assert_clean_and_unlocked('truncated')
 
 
 if __name__ == '__main__':

@@ -68,8 +68,11 @@ The connection timeout is 10 seconds and the read-inactivity timeout is 60 secon
 (not a total-download deadline). Networks or mirrors that require redirects, or
 pause longer than this between reads, are no longer accepted automatically; place
 trusted resources at the expected cache path instead of disabling TLS checks.
-The download regression tests use synthetic bytes only, without fetching models
-or datasets; they do not establish live availability or integrity of every resource.
+Run `python test/common/utils/test_install_http.py -v` for the download regression
+tests. They use synthetic bytes and a loopback HTTP server, without fetching
+models or datasets; they do not establish live availability or integrity of every
+resource. The loopback checks require `requests`, `filelock` and `tqdm`; they are
+skipped if these download dependencies are not installed.
 
 
 ## Usage

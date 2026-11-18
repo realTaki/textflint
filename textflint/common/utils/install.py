@@ -125,6 +125,5 @@ def http_get(folder_name, out_file, proxies=None):
             progress.close()
 
 
-
 if "TR_CACHE_DIR" in os.environ:
     set_cache_dir(os.environ["TR_CACHE_DIR"])
